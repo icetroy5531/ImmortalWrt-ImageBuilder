@@ -1,0 +1,272 @@
+
+name: Build 25.12.2 x86-64 Ftrace
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: icetroy5531/ImmortalWrt-Ftrace-Build
+  SOURCE_TAG: 25.12.2-ftrace-7
+  IB_FILE: immortalwrt-imagebuilder-25.12.2-x86-64.Linux-x86_64.tar.zst
+
+jobs:
+  build:
+    name: Build HomeLink Ftrace Firmware
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ImageBuilder dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            binutils \
+            gawk \
+            gettext \
+            libncurses-dev \
+            libssl-dev \
+            python3 \
+            python3-setuptools \
+            rsync \
+            unzip \
+            zlib1g-dev \
+            file \
+            wget \
+            curl \
+            zstd \
+            cpio \
+            xxd \
+            qemu-utils \
+            genisoimage \
+            xorriso \
+            libelf-dev \
+            python3-pyelftools
+
+          df -h
+          free -h
+
+      - name: Download custom Ftrace ImageBuilder
+        run: |
+          set -euo pipefail
+
+          mkdir -p downloads
+          cd downloads
+
+          URL="https://github.com/${SOURCE_REPO}/releases/download/${SOURCE_TAG}"
+
+          curl -fL --retry 3 \
+            "$URL/$IB_FILE" \
+            -o "$IB_FILE"
+
+          curl -fL --retry 3 \
+            "$URL/release-checksums.txt" \
+            -o release-checksums.txt
+
+          curl -fL --retry 3 \
+            "$URL/kernel.config" \
+            -o kernel.config
+
+          echo "===== Downloaded files ====="
+          ls -lh
+
+          echo "===== Verify SHA256 ====="
+
+          awk -v file="$IB_FILE" \
+            '$2 == file || $2 == "*" file' \
+            release-checksums.txt > imagebuilder.sha256
+
+          test -s imagebuilder.sha256
+          sha256sum -c imagebuilder.sha256
+
+          awk '$2 == "kernel.config" || $2 == "*kernel.config"' \
+            release-checksums.txt > kernel.sha256
+
+          test -s kernel.sha256
+          sha256sum -c kernel.sha256
+
+          zstd -t "$IB_FILE"
+
+      - name: Extract ImageBuilder
+        run: |
+          set -euo pipefail
+
+          mkdir -p imagebuilder
+
+          tar --zstd -xf "downloads/$IB_FILE" \
+            -C imagebuilder \
+            --strip-components=1
+
+          test -f imagebuilder/Makefile
+          test -f imagebuilder/.config
+          test -d imagebuilder/packages
+
+          echo "===== ImageBuilder directory ====="
+          ls -lah imagebuilder
+
+      - name: Verify original kernel configuration
+        run: |
+          set -euo pipefail
+
+          for OPTION in \
+            BPF \
+            BPF_SYSCALL \
+            BPF_JIT \
+            FTRACE \
+            FUNCTION_TRACER \
+            FUNCTION_GRAPH_TRACER \
+            DYNAMIC_FTRACE \
+            DYNAMIC_FTRACE_WITH_REGS \
+            DYNAMIC_FTRACE_WITH_ARGS \
+            DYNAMIC_FTRACE_WITH_DIRECT_CALLS \
+            DEBUG_INFO_BTF \
+            KPROBES \
+            KPROBE_EVENTS \
+            BPF_EVENTS \
+            IKCONFIG \
+            IKCONFIG_PROC
+          do
+            grep -qx "CONFIG_${OPTION}=y" downloads/kernel.config
+            echo "OK: CONFIG_${OPTION}=y"
+          done
+
+      - name: Verify ImageBuilder configuration
+        working-directory: imagebuilder
+        run: |
+          set -euo pipefail
+
+          echo "===== Partition sizes ====="
+
+          grep -x 'CONFIG_TARGET_KERNEL_PARTSIZE=128' .config
+          grep -x 'CONFIG_TARGET_ROOTFS_PARTSIZE=4096' .config
+
+          echo "===== Supported profiles ====="
+          make info
+
+          echo "===== Package repositories ====="
+
+          if [ -f repositories.conf ]; then
+            cat repositories.conf
+          fi
+
+          echo "===== Local APK packages ====="
+
+          find packages -type f -name '*.apk' | wc -l
+
+          echo "===== Local kernel packages ====="
+
+          find packages -type f \
+            \( -name 'kernel-*.apk' -o -name 'kmod-*.apk' \) \
+            > ../local-kmods.txt
+
+          test -s ../local-kmods.txt
+
+          head -n 30 ../local-kmods.txt
+
+      - name: Restrict package repositories to local packages
+        working-directory: imagebuilder
+        run: |
+          set -euo pipefail
+
+          test -f repositories.conf
+
+          cp repositories.conf ../repositories.original.conf
+
+          # Disable remote repositories for the first test.
+          # Use only packages shipped in this ImageBuilder.
+
+          sed -i -E \
+            '/^[[:space:]]*[^#].*(https?|ftp):\/\//s/^/# /' \
+            repositories.conf
+
+          echo "===== Local-only repositories ====="
+          cat repositories.conf
+
+      - name: Build Ftrace test firmware
+        working-directory: imagebuilder
+        run: |
+          set -euo pipefail
+
+          PACKAGES="luci luci-ssl luci-i18n-base-zh-cn"
+          PACKAGES="$PACKAGES ppp ppp-mod-pppoe kmod-pppoe"
+          PACKAGES="$PACKAGES odhcp6c odhcpd-ipv6only"
+          PACKAGES="$PACKAGES kmod-wireguard wireguard-tools"
+          PACKAGES="$PACKAGES luci-proto-wireguard"
+          PACKAGES="$PACKAGES kmod-nft-tproxy"
+          PACKAGES="$PACKAGES kmod-nft-socket kmod-nft-queue"
+          PACKAGES="$PACKAGES ip-full"
+          PACKAGES="$PACKAGES smartdns luci-app-smartdns"
+          PACKAGES="$PACKAGES luci-i18n-smartdns-zh-cn"
+
+          echo "===== Requested packages ====="
+          echo "$PACKAGES"
+
+          make image \
+            PROFILE="generic" \
+            PACKAGES="$PACKAGES" \
+            ROOTFS_PARTSIZE=4096 \
+            V=s 2>&1 | tee ../imagebuilder-build.log
+
+      - name: Collect firmware files
+        run: |
+          set -euo pipefail
+
+          mkdir -p release
+
+          OUT="imagebuilder/bin/targets/x86/64"
+
+          test -d "$OUT"
+
+          find "$OUT" -maxdepth 1 -type f \
+            \( -name '*combined-efi.img.gz' \
+            -o -name '*.manifest' \
+            -o -name 'profiles.json' \
+            -o -name 'version.buildinfo' \) \
+            -exec cp -v {} release/ \;
+
+          test -n "$(find release -name '*squashfs-combined-efi.img.gz' -print -quit)"
+
+          cp downloads/kernel.config release/source-kernel.config
+          cp imagebuilder/.config release/imagebuilder.config
+          cp local-kmods.txt release/
+
+          echo "===== Final firmware ====="
+
+          cd release
+          sha256sum * > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -lh
+
+      - name: Upload Ftrace test firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: HomeLink-25.12.2-Ftrace-Test
+          path: release/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ftrace-ImageBuilder-Diagnostics
+          path: |
+            imagebuilder-build.log
+            local-kmods.txt
+            repositories.original.conf
+            imagebuilder/repositories.conf
+            imagebuilder/.config
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 14
