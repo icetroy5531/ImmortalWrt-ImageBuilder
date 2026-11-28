@@ -173,24 +173,78 @@ jobs:
 
           head -n 30 ../local-kmods.txt
 
-      - name: Restrict package repositories to local packages
+
+      - name: Configure standalone APK repositories
         working-directory: imagebuilder
         run: |
           set -euo pipefail
 
-          test -f repositories.conf
+          echo "===== Verify APK standalone mode ====="
 
-          cp repositories.conf ../repositories.original.conf
+          grep -x 'CONFIG_USE_APK=y' .config
+          grep -x 'CONFIG_IB_STANDALONE=y' .config
 
-          # Disable remote repositories for the first test.
-          # Use only packages shipped in this ImageBuilder.
+          echo "===== Repository files ====="
+          ls -la repositories* 2>/dev/null || true
 
-          sed -i -E \
-            '/^[[:space:]]*[^#].*(https?|ftp):\/\//s/^/# /' \
-            repositories.conf
+          if [ -f repositories ]; then
+            cp repositories ../repositories.original.conf
+          fi
 
-          echo "===== Local-only repositories ====="
-          cat repositories.conf
+          # Disable all external repositories.
+          # ImageBuilder automatically uses packages/packages.adb.
+
+          : > repositories
+
+          echo "===== Local APK inventory ====="
+
+          find packages -maxdepth 1 -type f -name '*.apk' \
+            | sort > ../local-apk-packages.txt
+
+          COUNT=$(wc -l < ../local-apk-packages.txt)
+
+          echo "Total local APK packages: $COUNT"
+
+          test "$COUNT" -gt 0
+
+          echo "===== Local kernel packages ====="
+
+          find packages -maxdepth 1 -type f \
+            -name 'kernel-*.apk'
+
+          echo "===== Check requested packages ====="
+
+          for PKG in \
+            luci \
+            luci-ssl \
+            luci-i18n-base-zh-cn \
+            ppp \
+            ppp-mod-pppoe \
+            kmod-pppoe \
+            odhcp6c \
+            odhcpd-ipv6only \
+            kmod-wireguard \
+            wireguard-tools \
+            luci-proto-wireguard \
+            kmod-nft-tproxy \
+            kmod-nft-socket \
+            kmod-nft-queue \
+            ip-full \
+            smartdns \
+            luci-app-smartdns \
+            luci-i18n-smartdns-zh-cn
+          do
+            if find packages -maxdepth 1 -type f \
+              -name "$PKG-[0-9]*.apk" \
+              | grep -q .; then
+              echo "AVAILABLE: $PKG"
+            else
+              echo "NOT FOUND BY FILENAME: $PKG"
+            fi
+          done
+
+          echo "===== Standalone APK configuration ready ====="
+
 
       - name: Build Ftrace test firmware
         working-directory: imagebuilder
@@ -256,6 +310,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+
       - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -264,8 +319,9 @@ jobs:
           path: |
             imagebuilder-build.log
             local-kmods.txt
+            local-apk-packages.txt
             repositories.original.conf
-            imagebuilder/repositories.conf
+            imagebuilder/repositories
             imagebuilder/.config
           if-no-files-found: ignore
           include-hidden-files: true
